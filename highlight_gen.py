@@ -30,14 +30,47 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 import csv
 import dataclasses
 import io
+import itertools
+import os
 import re
 from typing import Any, TextIO, TypeAlias
 
+from absl import app
+from absl import flags
 from absl import logging
+import kagglehub
 from PIL import Image
 import requests
+import tqdm
+import transformers
 
 __version__ = '0.1.0'
+
+_INPUT_FILE = flags.DEFINE_string(
+    'input_file',
+    '',
+    'Path to the input product feed (CSV or TSV).',
+)
+_OUTPUT_FILE = flags.DEFINE_string(
+    'output_file',
+    '',
+    'Path to write the enriched feed to (always written as TSV).',
+)
+_NUM_ROWS = flags.DEFINE_integer(
+    'num_rows',
+    0,
+    'Number of feed rows to process. 0 processes all rows.',
+    lower_bound=0,
+)
+_MODEL_PATH = flags.DEFINE_string(
+    'model_path',
+    '',
+    'Local directory containing pre-downloaded Gemma weights. If empty, the '
+    'model is downloaded from Kaggle on first run.',
+)
+
+KAGGLE_MODEL_HANDLE = 'google/gemma-4/transformers/gemma-4-e2b-it'
+HIGHLIGHT_COLUMN = 'product_highlight'
 
 # Identifies the tool honestly to merchant CDNs. Requests that are refused
 # (e.g. HTTP 403) are skipped and logged rather than retried with a
@@ -47,6 +80,7 @@ USER_AGENT = (
     '(+https://github.com/google-marketing-solutions/highlight_gen)'
 )
 IMAGE_REQUEST_TIMEOUT_S = 10
+MAX_NEW_TOKENS = 512
 
 # Merchant Center limits, see
 # https://support.google.com/merchants/answer/9216100.
@@ -114,6 +148,21 @@ class HighlightResult:
 
   highlights: Sequence[str]
   error: str = ''
+
+
+@dataclasses.dataclass(frozen=True)
+class FeedSummary:
+  """Counts from processing a feed.
+
+  Attributes:
+    processed_count: Number of products processed.
+    failed_count: Number of processed products left without highlights.
+    skipped_line_count: Number of malformed input lines that were skipped.
+  """
+
+  processed_count: int
+  failed_count: int
+  skipped_line_count: int
 
 
 def _detect_delimiter(header_line: str, source_name: str) -> str:
@@ -416,3 +465,188 @@ def generate_highlights(
         ),
     )
   return HighlightResult(highlights=highlights)
+
+
+def validate_paths(input_path: str, output_path: str) -> None:
+  """Checks the feed paths before any work starts.
+
+  Args:
+    input_path: Path to the input feed.
+    output_path: Path the output feed will be written to.
+
+  Raises:
+    FileNotFoundError: If the input feed does not exist.
+    ValueError: If the output path is the input feed, which would be erased
+      before it is read.
+  """
+  if not os.path.isfile(input_path):
+    raise FileNotFoundError(
+        f'Input feed {input_path!r} does not exist or is not a regular file.'
+    )
+  if os.path.realpath(input_path) == os.path.realpath(output_path):
+    raise ValueError(
+        f'--output_file {output_path!r} is the input feed. Choose a different'
+        ' output path; the input would be erased before it is read.'
+    )
+
+
+def process_feed(
+    input_path: str,
+    output_path: str,
+    generator: TextGenerator,
+    num_rows: int = 0,
+    http_get: HttpGet = requests.get,
+) -> FeedSummary:
+  """Streams a feed through the model, writing each product as it finishes.
+
+  Products that fail are logged and written with an empty
+  `product_highlight` value, so the output never contains error text as
+  highlights. An existing `product_highlight` column is overwritten.
+
+  Args:
+    input_path: Path to the input feed (CSV or TSV).
+    output_path: Path to write the enriched TSV feed to.
+    generator: Sends chat messages to the model.
+    num_rows: Number of products to process. 0 processes all products.
+    http_get: Function used to download product images.
+
+  Returns:
+    Counts of processed, failed and skipped products.
+
+  Raises:
+    FileNotFoundError: If the input feed does not exist.
+    ValueError: If the paths are invalid, or the feed is malformed in a way
+      that cannot be skipped safely.
+  """
+  validate_paths(input_path, output_path)
+  processed_count = 0
+  failed_count = 0
+  # `utf-8-sig` drops the byte-order mark that spreadsheet exports often add.
+  with (
+      open(input_path, encoding='utf-8-sig', newline='') as input_file,
+      open(output_path, 'w', encoding='utf-8', newline='') as output_file,
+  ):
+    reader = FeedReader(input_file, input_path)
+    columns = list(reader.columns)
+    if HIGHLIGHT_COLUMN not in columns:
+      columns.append(HIGHLIGHT_COLUMN)
+    writer = TsvWriter(output_file, columns)
+    # Limiting the rows up front, rather than breaking out of the loop,
+    # lets the progress bar count the last product too.
+    products = itertools.islice(reader, num_rows) if num_rows else reader
+    for product in tqdm.tqdm(
+        products, total=num_rows or None, desc='Generating highlights'
+    ):
+      result = generate_highlights(product, generator, http_get)
+      if result.error:
+        failed_count += 1
+        logging.warning(
+            'No highlights for product %s: %s',
+            product.get('id') or '(no id)',
+            result.error,
+        )
+      writer.write_row(
+          {**product, HIGHLIGHT_COLUMN: format_highlights(result.highlights)}
+      )
+      processed_count += 1
+  return FeedSummary(
+      processed_count=processed_count,
+      failed_count=failed_count,
+      skipped_line_count=reader.skipped_line_count,
+  )
+
+
+def resolve_model_path(
+    model_path: str,
+    downloader: Callable[[str], str] = kagglehub.model_download,
+) -> str:
+  """Returns the directory to load the Gemma model from.
+
+  Args:
+    model_path: User-supplied local directory. If empty, the model is downloaded
+      from Kaggle instead.
+    downloader: Function that downloads a Kaggle model handle and returns its
+      local path.
+
+  Returns:
+    Path to a local directory containing the model weights.
+
+  Raises:
+    FileNotFoundError: If `model_path` is set but is not a directory.
+  """
+  if not model_path:
+    return downloader(KAGGLE_MODEL_HANDLE)
+  if not os.path.isdir(model_path):
+    raise FileNotFoundError(
+        f'--model_path {model_path!r} is not a directory. Pass a local'
+        ' directory containing the Gemma weights, or leave it empty to'
+        ' download the model from Kaggle.'
+    )
+  return model_path
+
+
+def load_generator(model_path: str) -> TextGenerator:
+  """Loads the Gemma model as a text generator.
+
+  Args:
+    model_path: Local directory containing the model weights.
+
+  Returns:
+    A function that sends chat messages to the model.
+  """
+  pipe = transformers.pipeline(
+      task='image-text-to-text',
+      model=model_path,
+      device_map='auto',
+      dtype='auto',
+  )
+
+  def _generate(messages: list[dict[str, Any]]) -> Any:
+    return pipe(
+        messages,
+        return_full_text=False,
+        generate_kwargs={'max_new_tokens': MAX_NEW_TOKENS},
+    )
+
+  return _generate
+
+
+def main(argv: Sequence[str]) -> None:
+  if len(argv) > 1:
+    raise app.UsageError('Too many command-line arguments.')
+  # Checked here rather than with `flags.mark_flags_as_required`, which has no
+  # effect on flags with a non-None default, and which would make the flags
+  # mandatory for anything that imports this module, such as tests.
+  if not _INPUT_FILE.value or not _OUTPUT_FILE.value:
+    raise app.UsageError('--input_file and --output_file are required.')
+
+  # Check the paths first, so a typo fails before the model is downloaded or
+  # loaded.
+  validate_paths(_INPUT_FILE.value, _OUTPUT_FILE.value)
+  generator = load_generator(resolve_model_path(_MODEL_PATH.value))
+  summary = process_feed(
+      _INPUT_FILE.value, _OUTPUT_FILE.value, generator, _NUM_ROWS.value
+  )
+  logging.info(
+      'Wrote %d product(s) to %s.', summary.processed_count, _OUTPUT_FILE.value
+  )
+  if summary.failed_count:
+    logging.warning(
+        '%d product(s) have no highlights; see warnings above.',
+        summary.failed_count,
+    )
+  if summary.skipped_line_count:
+    logging.warning(
+        'Skipped %d malformed line(s) in %s; see warnings above.',
+        summary.skipped_line_count,
+        _INPUT_FILE.value,
+    )
+
+
+def run() -> None:
+  """Entry point for the script and the `highlight-gen` console command."""
+  app.run(main)
+
+
+if __name__ == '__main__':
+  run()

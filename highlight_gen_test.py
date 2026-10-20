@@ -13,8 +13,11 @@
 # limitations under the License.
 
 import io
+import os
 
+from absl import app
 from absl.testing import absltest
+from absl.testing import flagsaver
 from absl.testing import parameterized
 from PIL import Image
 import requests
@@ -99,6 +102,18 @@ class _FakeGenerator:
     if self._error is not None:
       raise self._error
     return [{'generated_text': self._text}]
+
+
+class _FakeDownloader:
+  """Stands in for `kagglehub.model_download`, recording requested handles."""
+
+  def __init__(self, model_path: str = '/unused/model/path'):
+    self._model_path = model_path
+    self.handles = []
+
+  def __call__(self, handle: str) -> str:
+    self.handles.append(handle)
+    return self._model_path
 
 
 def _image_get() -> _FakeHttpGet:
@@ -387,6 +402,23 @@ def _read_feed(contents: str) -> tuple[list[str], list[dict[str, str]], int]:
   return reader.columns, rows, reader.skipped_line_count
 
 
+class _RunStoppedError(Exception):
+  """Simulates a run stopping part-way, e.g. a crash or Ctrl+C."""
+
+
+class _FailOnCallGenerator(_FakeGenerator):
+  """Succeeds, then raises an unexpected error on the given call number."""
+
+  def __init__(self, text: str, fail_on_call: int):
+    super().__init__(text)
+    self._fail_on_call = fail_on_call
+
+  def __call__(self, messages):
+    if len(self.calls) + 1 == self._fail_on_call:
+      raise _RunStoppedError('Run stopped')
+    return super().__call__(messages)
+
+
 class FeedReaderTest(parameterized.TestCase):
 
   @parameterized.named_parameters(
@@ -457,6 +489,177 @@ class TsvWriterTest(absltest.TestCase):
     writer.write_row({'id': 'sku-1'})
 
     self.assertEqual(output.getvalue().splitlines()[1], 'sku-1\t')
+
+
+class ProcessFeedTest(absltest.TestCase):
+
+  def _run(
+      self,
+      input_contents: str,
+      generator: _FakeGenerator,
+      num_rows: int = 0,
+  ) -> tuple[highlight_gen.FeedSummary, list[str]]:
+    input_path = self.create_tempfile(content=input_contents).full_path
+    output_path = os.path.join(self.create_tempdir().full_path, 'out.tsv')
+    summary = highlight_gen.process_feed(
+        input_path, output_path, generator, num_rows, _image_get()
+    )
+    with open(output_path, encoding='utf-8') as f:
+      return summary, f.read().splitlines()
+
+  def test_writes_highlights_and_leaves_failures_empty(self):
+    feed = 'id,image_link\nok,https://cdn.example.com/a.jpg\nbad,\n'
+    generator = _FakeGenerator('Breathable mesh, Grippy sole')
+
+    summary, lines = self._run(feed, generator)
+
+    self.assertEqual(
+        lines,
+        [
+            'id\timage_link\tproduct_highlight',
+            'ok\thttps://cdn.example.com/a.jpg\tBreathable mesh,Grippy sole',
+            'bad\t\t',
+        ],
+    )
+    self.assertEqual(summary.processed_count, 2)
+    self.assertEqual(summary.failed_count, 1)
+
+  def test_overwrites_existing_highlight_column(self):
+    feed = (
+        'id,image_link,product_highlight\n'
+        'ok,https://cdn.example.com/a.jpg,Old value\n'
+    )
+    generator = _FakeGenerator('Breathable mesh, Grippy sole')
+
+    _, lines = self._run(feed, generator)
+
+    self.assertEqual(
+        lines,
+        [
+            'id\timage_link\tproduct_highlight',
+            'ok\thttps://cdn.example.com/a.jpg\tBreathable mesh,Grippy sole',
+        ],
+    )
+
+  def test_num_rows_limits_products(self):
+    feed = (
+        'id,image_link\n'
+        'a,https://cdn.example.com/a.jpg\n'
+        'b,https://cdn.example.com/b.jpg\n'
+        'c,https://cdn.example.com/c.jpg\n'
+    )
+    generator = _FakeGenerator('Breathable mesh, Grippy sole')
+
+    summary, lines = self._run(feed, generator, num_rows=2)
+
+    self.assertEqual(summary.processed_count, 2)
+    self.assertLen(lines, 3)
+    self.assertLen(generator.calls, 2)
+
+  def test_finished_products_are_kept_if_run_stops(self):
+    feed = (
+        'id,image_link\n'
+        'a,https://cdn.example.com/a.jpg\n'
+        'b,https://cdn.example.com/b.jpg\n'
+    )
+    input_path = self.create_tempfile(content=feed).full_path
+    output_path = os.path.join(self.create_tempdir().full_path, 'out.tsv')
+    generator = _FailOnCallGenerator('Breathable mesh, Grippy sole', 2)
+
+    with self.assertRaisesRegex(_RunStoppedError, 'Run stopped'):
+      highlight_gen.process_feed(
+          input_path, output_path, generator, 0, _image_get()
+      )
+
+    with open(output_path, encoding='utf-8') as f:
+      lines = f.read().splitlines()
+    self.assertEqual(
+        lines,
+        [
+            'id\timage_link\tproduct_highlight',
+            'a\thttps://cdn.example.com/a.jpg\tBreathable mesh,Grippy sole',
+        ],
+    )
+
+  def test_failure_with_empty_id_is_logged_as_no_id(self):
+    feed = 'id,title,image_link\n,Trail shoe,\n'
+
+    with self.assertLogs(level='WARNING') as logs:
+      self._run(feed, _FakeGenerator('unused'))
+
+    self.assertIn('No highlights for product (no id):', logs.output[0])
+
+  def test_output_path_equal_to_input_raises_and_keeps_input(self):
+    feed = 'id,image_link\na,https://cdn.example.com/a.jpg\n'
+    input_path = self.create_tempfile(content=feed).full_path
+
+    with self.assertRaisesRegex(ValueError, 'is the input feed'):
+      highlight_gen.process_feed(
+          input_path, input_path, _FakeGenerator('unused'), 0, _image_get()
+      )
+
+    with open(input_path, encoding='utf-8') as f:
+      self.assertEqual(f.read(), feed)
+
+  def test_missing_input_raises(self):
+    missing = os.path.join(self.create_tempdir().full_path, 'missing.csv')
+    output_path = os.path.join(self.create_tempdir().full_path, 'out.tsv')
+
+    with self.assertRaisesRegex(
+        FileNotFoundError, 'does not exist or is not a regular file'
+    ):
+      highlight_gen.process_feed(
+          missing, output_path, _FakeGenerator('unused'), 0, _image_get()
+      )
+
+
+class ResolveModelPathTest(absltest.TestCase):
+
+  def test_empty_path_downloads_from_kaggle(self):
+    downloader = _FakeDownloader(model_path='/cache/gemma')
+
+    path = highlight_gen.resolve_model_path('', downloader)
+
+    self.assertEqual(path, '/cache/gemma')
+    self.assertEqual(
+        downloader.handles, ['google/gemma-4/transformers/gemma-4-e2b-it']
+    )
+
+  def test_existing_directory_is_used_without_download(self):
+    model_dir = self.create_tempdir().full_path
+    downloader = _FakeDownloader()
+
+    path = highlight_gen.resolve_model_path(model_dir, downloader)
+
+    self.assertEqual(path, model_dir)
+    self.assertEmpty(downloader.handles)
+
+  def test_missing_directory_raises(self):
+    missing = os.path.join(self.create_tempdir().full_path, 'missing')
+    downloader = _FakeDownloader()
+
+    with self.assertRaisesRegex(FileNotFoundError, 'not a directory'):
+      highlight_gen.resolve_model_path(missing, downloader)
+    self.assertEmpty(downloader.handles)
+
+
+class MainTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      ('missing_input', '', 'out.tsv'),
+      ('missing_output', 'feed.csv', ''),
+  )
+  def test_missing_required_flag_raises_usage_error(
+      self, input_file, output_file
+  ):
+    with flagsaver.flagsaver(input_file=input_file, output_file=output_file):
+      with self.assertRaisesRegex(app.UsageError, 'are required'):
+        highlight_gen.main(['highlight_gen'])
+
+  def test_extra_positional_argument_raises_usage_error(self):
+    with flagsaver.flagsaver(input_file='feed.csv', output_file='out.tsv'):
+      with self.assertRaisesRegex(app.UsageError, 'Too many'):
+        highlight_gen.main(['highlight_gen', 'unexpected_arg'])
 
 
 if __name__ == '__main__':
