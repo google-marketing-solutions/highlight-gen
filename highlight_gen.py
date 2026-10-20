@@ -80,6 +80,10 @@ USER_AGENT = (
     '(+https://github.com/google-marketing-solutions/highlight_gen)'
 )
 IMAGE_REQUEST_TIMEOUT_S = 10
+# Product images are rarely more than a few MB. The cap stops a single
+# oversized or misconfigured URL from exhausting memory.
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+_IMAGE_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 MAX_NEW_TOKENS = 512
 
 # Merchant Center limits, see
@@ -308,6 +312,40 @@ def select_image_url(product: Mapping[str, str]) -> str:
   return ''
 
 
+def _image_too_large_error(url: str) -> ImageFetchError:
+  """Returns the error for an image larger than `MAX_IMAGE_BYTES`."""
+  return ImageFetchError(
+      f'Image {url} is larger than the'
+      f' {MAX_IMAGE_BYTES // (1024 * 1024)} MB limit'
+  )
+
+
+def _read_image_bytes(response: requests.Response, url: str) -> bytes:
+  """Reads a streamed response body, stopping once it exceeds the size cap.
+
+  Args:
+    response: A response opened with `stream=True`.
+    url: The image URL, for the error message.
+
+  Returns:
+    The response body.
+
+  Raises:
+    ImageFetchError: If the body is larger than `MAX_IMAGE_BYTES`.
+  """
+  # Reject early when the server declares the size up front.
+  declared_size = response.headers.get('Content-Length', '')
+  if declared_size.isdigit() and int(declared_size) > MAX_IMAGE_BYTES:
+    raise _image_too_large_error(url)
+  # The declared size can be missing or wrong, so also count while reading.
+  body = bytearray()
+  for chunk in response.iter_content(chunk_size=_IMAGE_DOWNLOAD_CHUNK_BYTES):
+    body += chunk
+    if len(body) > MAX_IMAGE_BYTES:
+      raise _image_too_large_error(url)
+  return bytes(body)
+
+
 def fetch_image(url: str, http_get: HttpGet = requests.get) -> Image.Image:
   """Downloads and decodes a product image.
 
@@ -319,21 +357,31 @@ def fetch_image(url: str, http_get: HttpGet = requests.get) -> Image.Image:
     The decoded image in RGB mode.
 
   Raises:
-    ImageFetchError: If the request fails, is refused or returns data that
-      is not an image.
+    ImageFetchError: If the request fails or is refused, the image is larger
+      than `MAX_IMAGE_BYTES`, or the data is not a decodable image.
   """
   try:
     response = http_get(
         url,
         headers={'User-Agent': USER_AGENT},
         timeout=IMAGE_REQUEST_TIMEOUT_S,
+        stream=True,
     )
-    response.raise_for_status()
+    # Closing the response releases the connection even if reading stops
+    # early.
+    with response:
+      response.raise_for_status()
+      content = _read_image_bytes(response, url)
   except requests.RequestException as e:
     raise ImageFetchError(f'Could not download image {url}: {e}') from e
   try:
-    return Image.open(io.BytesIO(response.content)).convert('RGB')
-  except (Image.UnidentifiedImageError, OSError) as e:
+    return Image.open(io.BytesIO(content)).convert('RGB')
+  except (
+      Image.UnidentifiedImageError,
+      Image.DecompressionBombError,
+      OSError,
+      ValueError,
+  ) as e:
     raise ImageFetchError(f'Could not decode image {url}: {e}') from e
 
 

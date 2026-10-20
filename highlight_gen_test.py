@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterator
 import io
 import os
+from unittest import mock
 
 from absl import app
 from absl.testing import absltest
@@ -49,7 +51,7 @@ def _product(**overrides: str) -> dict[str, str]:
 
 
 class _FakeResponse(requests.Response):
-  """An HTTP response with a fixed status code and body.
+  """An HTTP response with a fixed status code, body and headers.
 
   Attributes:
     status_code: The HTTP status code.
@@ -57,16 +59,33 @@ class _FakeResponse(requests.Response):
     url: The URL that was requested.
   """
 
-  def __init__(self, status_code: int, body: bytes = b''):
+  def __init__(
+      self,
+      status_code: int,
+      body: bytes = b'',
+      headers: dict[str, str] | None = None,
+  ):
     super().__init__()
     self.status_code = status_code
     self.reason = 'OK' if status_code < 400 else 'Error'
     self.url = _IMAGE_URL
+    self.headers.update(headers or {})
     self._body = body
 
   @property
   def content(self) -> bytes:
     return self._body
+
+  def iter_content(
+      self, chunk_size: int | None = 1, decode_unicode: bool = False
+  ) -> Iterator[bytes]:
+    del decode_unicode  # Unused.
+    step = chunk_size or len(self._body) or 1
+    for start in range(0, len(self._body), step):
+      yield self._body[start : start + step]
+
+  def close(self) -> None:
+    pass  # There is no network connection to release.
 
 
 class _FakeHttpGet:
@@ -220,6 +239,41 @@ class FetchImageTest(absltest.TestCase):
 
     with self.assertRaisesRegex(highlight_gen.ImageFetchError, 'decode'):
       highlight_gen.fetch_image(_IMAGE_URL, http_get)
+
+  def test_streams_the_download(self):
+    http_get = _image_get()
+
+    highlight_gen.fetch_image(_IMAGE_URL, http_get)
+
+    _, kwargs = http_get.calls[0]
+    self.assertTrue(kwargs['stream'])
+
+  def test_declared_size_over_limit_raises(self):
+    http_get = _FakeHttpGet(
+        _FakeResponse(
+            200, _png_bytes(), headers={'Content-Length': str(20 * 1024**2 + 1)}
+        )
+    )
+
+    with self.assertRaisesRegex(
+        highlight_gen.ImageFetchError, 'larger than the 20 MB limit'
+    ):
+      highlight_gen.fetch_image(_IMAGE_URL, http_get)
+
+  def test_body_over_limit_raises_when_size_is_not_declared(self):
+    http_get = _FakeHttpGet(_FakeResponse(200, b'\0' * (20 * 1024**2 + 1)))
+
+    with self.assertRaisesRegex(
+        highlight_gen.ImageFetchError, 'larger than the 20 MB limit'
+    ):
+      highlight_gen.fetch_image(_IMAGE_URL, http_get)
+
+  def test_decompression_bomb_raises(self):
+    # PIL refuses images over twice MAX_IMAGE_PIXELS; the test image has 16.
+    self.enter_context(mock.patch.object(Image, 'MAX_IMAGE_PIXELS', 4))
+
+    with self.assertRaisesRegex(highlight_gen.ImageFetchError, 'decode'):
+      highlight_gen.fetch_image(_IMAGE_URL, _image_get())
 
 
 class BuildMessagesTest(absltest.TestCase):
