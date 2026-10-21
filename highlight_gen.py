@@ -77,7 +77,7 @@ HIGHLIGHT_COLUMN = 'product_highlight'
 # different identity.
 USER_AGENT = (
     f'HighlightGen/{__version__} '
-    '(+https://github.com/google-marketing-solutions/highlight_gen)'
+    '(+https://github.com/google-marketing-solutions/highlight-gen)'
 )
 IMAGE_REQUEST_TIMEOUT_S = 10
 # Product images are rarely more than a few MB. The cap stops a single

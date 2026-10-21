@@ -219,7 +219,7 @@ class FetchImageTest(absltest.TestCase):
     self.assertEqual(
         kwargs['headers']['User-Agent'],
         'HighlightGen/0.1.0'
-        ' (+https://github.com/google-marketing-solutions/highlight_gen)',
+        ' (+https://github.com/google-marketing-solutions/highlight-gen)',
     )
 
   def test_returns_rgb_image(self):
