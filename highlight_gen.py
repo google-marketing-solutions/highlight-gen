@@ -86,6 +86,10 @@ MAX_IMAGE_BYTES = 20 * 1024 * 1024
 _IMAGE_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 MAX_NEW_TOKENS = 512
 
+# Stop the run when the model fails on this many products in a row, since the
+# cause (e.g. GPU out of memory) is then almost certainly systemic.
+MAX_CONSECUTIVE_MODEL_FAILURES = 10
+
 # The csv module's default field size limit (128 KiB) is too small for some
 # feeds, e.g. descriptions containing HTML.
 _MAX_FEED_FIELD_BYTES = 10 * 1024 * 1024
@@ -145,6 +149,10 @@ class ImageFetchError(Exception):
   """Raised when a product image cannot be downloaded or decoded."""
 
 
+class TooManyModelFailuresError(RuntimeError):
+  """Raised when the model fails on too many products in a row."""
+
+
 @dataclasses.dataclass(frozen=True)
 class HighlightResult:
   """The outcome of generating highlights for one product.
@@ -152,10 +160,13 @@ class HighlightResult:
   Attributes:
     highlights: The validated highlights. Empty if generation failed.
     error: Why generation failed, or an empty string on success.
+    model_failed: Whether the failure came from the model call itself, as
+      opposed to the product's data (e.g. a missing or unreachable image).
   """
 
   highlights: Sequence[str]
   error: str = ''
+  model_failed: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -164,11 +175,14 @@ class FeedSummary:
 
   Attributes:
     processed_count: Number of products processed.
-    failed_count: Number of processed products left without highlights.
+    written_count: Number of processed products written with highlights.
+    failed_count: Number of processed products left out of the output because no
+      valid highlights could be generated.
     skipped_line_count: Number of malformed input lines that were skipped.
   """
 
   processed_count: int
+  written_count: int
   failed_count: int
   skipped_line_count: int
 
@@ -554,7 +568,12 @@ def generate_highlights(
   try:
     output = generator(build_messages(product, image))
   except (RuntimeError, ValueError) as e:
-    return HighlightResult(highlights=(), error=f'Model generation failed: {e}')
+    # RuntimeError includes torch.OutOfMemoryError and CUDA errors.
+    return HighlightResult(
+        highlights=(),
+        error=f'Model generation failed: {e}',
+        model_failed=True,
+    )
 
   highlights = parse_highlights(clean_model_output(output[0]['generated_text']))
   if len(highlights) < MIN_HIGHLIGHTS:
@@ -566,6 +585,37 @@ def generate_highlights(
         ),
     )
   return HighlightResult(highlights=highlights)
+
+
+def _generate_highlights_isolated(
+    product: Mapping[str, str],
+    generator: TextGenerator,
+    http_get: HttpGet,
+) -> HighlightResult:
+  """Calls `generate_highlights`, turning unexpected errors into a result.
+
+  This is the isolation point that stops one bad product from ending a run
+  that may last days. Unexpected errors are logged with their traceback and
+  counted as model failures, so a bug that affects every product still stops
+  the run (see `MAX_CONSECUTIVE_MODEL_FAILURES`).
+
+  Args:
+    product: One feed row.
+    generator: Sends chat messages to the model.
+    http_get: Function used to download the product image.
+
+  Returns:
+    The result of `generate_highlights`, or a failed result.
+  """
+  try:
+    return generate_highlights(product, generator, http_get)
+  except Exception as e:
+    logging.exception(
+        'Unexpected error for product %s', product.get('id') or '(no id)'
+    )
+    return HighlightResult(
+        highlights=(), error=f'Unexpected error: {e!r}', model_failed=True
+    )
 
 
 def validate_paths(input_path: str, output_path: str) -> None:
@@ -600,9 +650,14 @@ def process_feed(
 ) -> FeedSummary:
   """Streams a feed through the model, writing each product as it finishes.
 
-  Products that fail are logged and written with an empty
-  `product_highlight` value, so the output never contains error text as
-  highlights. An existing `product_highlight` column is overwritten.
+  Only products with valid highlights are written. Products that fail are
+  logged and left out of the output, so it never contains empty or error
+  values as highlights. An existing `product_highlight` column is overwritten.
+
+  If the model fails on `MAX_CONSECUTIVE_MODEL_FAILURES` products in a row, the
+  run stops, since the cause (e.g. GPU out of memory) is then almost certainly
+  systemic. Failures caused by a product's data, such as an unreachable image,
+  do not count towards this limit and reset it.
 
   Args:
     input_path: Path to the input feed (CSV or TSV).
@@ -612,16 +667,19 @@ def process_feed(
     http_get: Function used to download product images.
 
   Returns:
-    Counts of processed, failed and skipped products.
+    Counts of processed, written, failed and skipped products.
 
   Raises:
     FileNotFoundError: If the input feed does not exist.
     ValueError: If the paths are invalid, or the feed is malformed in a way
       that cannot be skipped safely.
+    TooManyModelFailuresError: If the model fails on too many products in a
+      row.
   """
   validate_paths(input_path, output_path)
   processed_count = 0
   failed_count = 0
+  consecutive_model_failures = 0
   # `utf-8-sig` drops the byte-order mark that spreadsheet exports often add.
   with (
       open(input_path, encoding='utf-8-sig', newline='') as input_file,
@@ -638,20 +696,32 @@ def process_feed(
     for product in tqdm.tqdm(
         products, total=num_rows or None, desc='Generating highlights'
     ):
-      result = generate_highlights(product, generator, http_get)
-      if result.error:
-        failed_count += 1
-        logging.warning(
-            'No highlights for product %s: %s',
-            product.get('id') or '(no id)',
-            result.error,
-        )
-      writer.write_row(
-          {**product, HIGHLIGHT_COLUMN: format_highlights(result.highlights)}
-      )
+      result = _generate_highlights_isolated(product, generator, http_get)
       processed_count += 1
+      if not result.error:
+        consecutive_model_failures = 0
+        writer.write_row(
+            {**product, HIGHLIGHT_COLUMN: format_highlights(result.highlights)}
+        )
+        continue
+      failed_count += 1
+      logging.warning(
+          'No highlights for product %s: %s',
+          product.get('id') or '(no id)',
+          result.error,
+      )
+      if not result.model_failed:
+        consecutive_model_failures = 0
+        continue
+      consecutive_model_failures += 1
+      if consecutive_model_failures >= MAX_CONSECUTIVE_MODEL_FAILURES:
+        raise TooManyModelFailuresError(
+            f'The model failed on {consecutive_model_failures} products in a'
+            f' row; last error: {result.error}. Fix the cause and re-run.'
+        )
   return FeedSummary(
       processed_count=processed_count,
+      written_count=processed_count - failed_count,
       failed_count=failed_count,
       skipped_line_count=reader.skipped_line_count,
   )
@@ -729,11 +799,12 @@ def main(argv: Sequence[str]) -> None:
       _INPUT_FILE.value, _OUTPUT_FILE.value, generator, _NUM_ROWS.value
   )
   logging.info(
-      'Wrote %d product(s) to %s.', summary.processed_count, _OUTPUT_FILE.value
+      'Wrote %d product(s) to %s.', summary.written_count, _OUTPUT_FILE.value
   )
   if summary.failed_count:
     logging.warning(
-        '%d product(s) have no highlights; see warnings above.',
+        '%d product(s) were left out because no valid highlights could be'
+        ' generated; see warnings above.',
         summary.failed_count,
     )
   if summary.skipped_line_count:

@@ -123,6 +123,24 @@ class _FakeGenerator:
     return [{'generated_text': self._text}]
 
 
+class _SequenceGenerator:
+  """Stands in for the Gemma pipeline, with one outcome per call, in order.
+
+  Each outcome is either the generated text or an exception to raise.
+  """
+
+  def __init__(self, outcomes: list[str | Exception]):
+    self._outcomes = list(outcomes)
+    self.calls = []
+
+  def __call__(self, messages):
+    self.calls.append(messages)
+    outcome = self._outcomes.pop(0)
+    if isinstance(outcome, Exception):
+      raise outcome
+    return [{'generated_text': outcome}]
+
+
 class _FakeDownloader:
   """Stands in for `kagglehub.model_download`, recording requested handles."""
 
@@ -428,6 +446,7 @@ class GenerateHighlightsTest(absltest.TestCase):
     self.assertIn('Could not download image', result.error)
     self.assertEmpty(result.highlights)
     self.assertEmpty(generator.calls)
+    self.assertFalse(result.model_failed)
 
   def test_too_few_highlights_is_reported(self):
     generator = _FakeGenerator('Breathable mesh')
@@ -448,6 +467,7 @@ class GenerateHighlightsTest(absltest.TestCase):
 
     self.assertIn('out of memory', result.error)
     self.assertEmpty(result.highlights)
+    self.assertTrue(result.model_failed)
 
 
 def _read_feed(contents: str) -> tuple[list[str], list[dict[str, str]], int]:
@@ -456,8 +476,14 @@ def _read_feed(contents: str) -> tuple[list[str], list[dict[str, str]], int]:
   return reader.columns, rows, reader.skipped_line_count
 
 
-class _RunStoppedError(Exception):
-  """Simulates a run stopping part-way, e.g. a crash or Ctrl+C."""
+def _feed_with_images(*product_ids: str) -> str:
+  """Returns a CSV feed with one product per ID, each with an image link."""
+  rows = [f'{id_},https://cdn.example.com/{id_}.jpg' for id_ in product_ids]
+  return '\n'.join(['id,image_link', *rows]) + '\n'
+
+
+class _RunStoppedError(KeyboardInterrupt):
+  """Simulates a run stopping part-way, e.g. Ctrl+C or a killed job."""
 
 
 class _FailOnCallGenerator(_FakeGenerator):
@@ -595,18 +621,19 @@ class ProcessFeedTest(absltest.TestCase):
   def _run(
       self,
       input_contents: str,
-      generator: _FakeGenerator,
+      generator: _FakeGenerator | _SequenceGenerator,
       num_rows: int = 0,
+      http_get: _FakeHttpGet | None = None,
   ) -> tuple[highlight_gen.FeedSummary, list[str]]:
     input_path = self.create_tempfile(content=input_contents).full_path
     output_path = os.path.join(self.create_tempdir().full_path, 'out.tsv')
     summary = highlight_gen.process_feed(
-        input_path, output_path, generator, num_rows, _image_get()
+        input_path, output_path, generator, num_rows, http_get or _image_get()
     )
     with open(output_path, encoding='utf-8') as f:
       return summary, f.read().splitlines()
 
-  def test_writes_highlights_and_leaves_failures_empty(self):
+  def test_writes_highlights_and_leaves_failures_out(self):
     feed = 'id,image_link\nok,https://cdn.example.com/a.jpg\nbad,\n'
     generator = _FakeGenerator('Breathable mesh, Grippy sole')
 
@@ -617,10 +644,10 @@ class ProcessFeedTest(absltest.TestCase):
         [
             'id\timage_link\tproduct_highlight',
             'ok\thttps://cdn.example.com/a.jpg\tBreathable mesh,Grippy sole',
-            'bad\t\t',
         ],
     )
     self.assertEqual(summary.processed_count, 2)
+    self.assertEqual(summary.written_count, 1)
     self.assertEqual(summary.failed_count, 1)
 
   def test_overwrites_existing_highlight_column(self):
@@ -710,6 +737,67 @@ class ProcessFeedTest(absltest.TestCase):
       highlight_gen.process_feed(
           missing, output_path, _FakeGenerator('unused'), 0, _image_get()
       )
+
+  def test_unexpected_error_affects_only_that_product(self):
+    generator = _SequenceGenerator(
+        [TypeError('unexpected'), 'Breathable mesh, Grippy sole']
+    )
+
+    summary, lines = self._run(_feed_with_images('a', 'b'), generator)
+
+    self.assertEqual(
+        lines[1:],
+        ['b\thttps://cdn.example.com/b.jpg\tBreathable mesh,Grippy sole'],
+    )
+    self.assertEqual(summary.failed_count, 1)
+
+  def test_model_failures_are_left_out_and_reset_by_a_success(self):
+    model_error = RuntimeError('CUDA error')
+    generator = _SequenceGenerator(
+        [model_error] * 9 + ['Breathable mesh, Grippy sole'] + [model_error] * 9
+    )
+
+    summary, lines = self._run(
+        _feed_with_images(*'abcdefghijklmnopqrs'), generator
+    )
+
+    self.assertEqual(
+        lines[1:],
+        ['j\thttps://cdn.example.com/j.jpg\tBreathable mesh,Grippy sole'],
+    )
+    self.assertEqual(summary.written_count, 1)
+    self.assertEqual(summary.failed_count, 18)
+
+  def test_consecutive_model_failures_stop_the_run_without_writing_them(self):
+    input_path = self.create_tempfile(
+        content=_feed_with_images(*'abcdefghijk')
+    ).full_path
+    output_path = os.path.join(self.create_tempdir().full_path, 'out.tsv')
+    generator = _FakeGenerator(error=RuntimeError('CUDA error'))
+
+    with self.assertRaises(highlight_gen.TooManyModelFailuresError) as raised:
+      highlight_gen.process_feed(
+          input_path, output_path, generator, 0, _image_get()
+      )
+
+    self.assertIn('10 products in a row', str(raised.exception))
+    with open(output_path, encoding='utf-8') as f:
+      self.assertEqual(
+          f.read().splitlines(), ['id\timage_link\tproduct_highlight']
+      )
+    self.assertLen(generator.calls, 10)
+
+  def test_image_failures_do_not_stop_the_run(self):
+    generator = _FakeGenerator('unused')
+
+    summary, _ = self._run(
+        _feed_with_images(*'abcdefghijk'),
+        generator,
+        http_get=_FakeHttpGet(_FakeResponse(403)),
+    )
+
+    self.assertEqual(summary.processed_count, 11)
+    self.assertEqual(summary.failed_count, 11)
 
 
 class ResolveModelPathTest(absltest.TestCase):
