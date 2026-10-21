@@ -86,6 +86,10 @@ MAX_IMAGE_BYTES = 20 * 1024 * 1024
 _IMAGE_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 MAX_NEW_TOKENS = 512
 
+# The csv module's default field size limit (128 KiB) is too small for some
+# feeds, e.g. descriptions containing HTML.
+_MAX_FEED_FIELD_BYTES = 10 * 1024 * 1024
+
 # Merchant Center limits, see
 # https://support.google.com/merchants/answer/9216100.
 MIN_HIGHLIGHTS = 2
@@ -201,7 +205,13 @@ class FeedReader:
   The delimiter is detected from the header line. Lines with more fields than
   the header are skipped and logged, since there is no safe way to tell which
   value belongs to which column. Lines with fewer fields are kept, and the
-  missing trailing values are treated as empty. Blank lines are ignored.
+  missing trailing values are treated as empty. Blank lines are ignored, and
+  NULL bytes are removed.
+
+  Quoting is parsed strictly. A broken quoted value (e.g. a missing closing
+  quote) raises an error rather than being skipped, because the parser cannot
+  tell where the broken record ends: it would otherwise silently absorb the
+  rest of the file into one value, or turn it into made-up products.
 
   Attributes:
     columns: Column names from the header row, stripped and lower-cased.
@@ -216,13 +226,29 @@ class FeedReader:
       source_name: Name of the feed, used in log and error messages.
 
     Raises:
-      ValueError: If the feed's delimiter cannot be detected.
+      ValueError: If the feed's delimiter cannot be detected, or its header is
+        malformed or not valid UTF-8.
     """
     self._source_name = source_name
-    delimiter = _detect_delimiter(feed_file.readline(), source_name)
+    try:
+      header_line = feed_file.readline()
+    except UnicodeDecodeError as e:
+      raise self._encoding_error(1, e) from e
+    delimiter = _detect_delimiter(header_line, source_name)
     feed_file.seek(0)
-    self._reader = csv.reader(feed_file, delimiter=delimiter)
-    self.columns = [column.strip().lower() for column in next(self._reader)]
+    # Raises the process-wide limit, but never lowers it, so this is harmless
+    # when the module is used as a library.
+    csv.field_size_limit(max(csv.field_size_limit(), _MAX_FEED_FIELD_BYTES))
+    self._reader = csv.reader(
+        (line.replace('\0', '') for line in feed_file),
+        delimiter=delimiter,
+        strict=True,
+    )
+    try:
+      header = next(self._reader)
+    except csv.Error as e:
+      raise self._malformed_record_error(1, e) from e
+    self.columns = [column.strip().lower() for column in header]
     self.skipped_line_count = 0
 
   def __iter__(self) -> Iterator[dict[str, str]]:
@@ -231,8 +257,22 @@ class FeedReader:
     Yields:
       One dict per product, keyed by the lower-cased column names. Missing
       trailing values are empty strings.
+
+    Raises:
+      ValueError: If a record is malformed in a way that cannot be skipped
+        safely, or the feed is not valid UTF-8.
     """
-    for fields in self._reader:
+    while True:
+      start_line = self._reader.line_num + 1
+      try:
+        fields = next(self._reader)
+      except StopIteration:
+        return
+      except csv.Error as e:
+        raise self._malformed_record_error(start_line, e) from e
+      except UnicodeDecodeError as e:
+        raise self._encoding_error(start_line, e) from e
+
       if not any(field.strip() for field in fields):
         continue
       if len(fields) > len(self.columns):
@@ -247,6 +287,19 @@ class FeedReader:
         continue
       fields += [''] * (len(self.columns) - len(fields))
       yield dict(zip(self.columns, fields))
+
+  def _malformed_record_error(self, line: int, error: csv.Error) -> ValueError:
+    return ValueError(
+        f'{self._source_name} has a malformed record starting at line'
+        f' {line}: {error}. Fix the record and re-run.'
+    )
+
+  def _encoding_error(self, line: int, error: UnicodeDecodeError) -> ValueError:
+    # Text is decoded in blocks, so the error position is only approximate.
+    return ValueError(
+        f'{self._source_name} is not valid UTF-8 near line {line}: {error}.'
+        ' Re-save the file as UTF-8 and re-run.'
+    )
 
 
 class TsvWriter:

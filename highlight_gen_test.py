@@ -513,6 +513,51 @@ class FeedReaderTest(parameterized.TestCase):
     with self.assertRaisesRegex(ValueError, 'Could not detect the delimiter'):
       _read_feed('title\nShoe\n')
 
+  def test_reads_values_longer_than_default_csv_limit(self):
+    long_description = 'x' * 200_000
+
+    _, rows, _ = _read_feed(f'id,description\nsku-1,{long_description}\n')
+
+    self.assertEqual(rows[0]['description'], long_description)
+
+  def test_removes_null_bytes(self):
+    _, rows, _ = _read_feed('id,title\nsku-1,Sh\0oe\n')
+
+    self.assertEqual(rows[0]['title'], 'Shoe')
+
+  def test_unterminated_quote_raises_with_start_line(self):
+    feed = 'id,title\na,Shoe\nb,"Boot\nc,Sock\n'
+
+    with self.assertRaisesRegex(
+        ValueError, 'malformed record starting at line 3'
+    ):
+      _read_feed(feed)
+
+  def test_malformed_header_raises_with_line_1(self):
+    with self.assertRaisesRegex(
+        ValueError, 'malformed record starting at line 1'
+    ):
+      _read_feed('id,"title\nsku-1,Shoe\n')
+
+  def test_invalid_utf8_in_header_block_raises(self):
+    # The first block of text (about 8 KB) is decoded when the header is read,
+    # so this fails while opening the feed.
+    feed = io.TextIOWrapper(
+        io.BytesIO(b'id,title\nsku-1,Caf\xe9\n'), encoding='utf-8', newline=''
+    )
+
+    with self.assertRaisesRegex(ValueError, 'not valid UTF-8 near line 1'):
+      highlight_gen.FeedReader(feed, 'feed.csv')
+
+  def test_invalid_utf8_after_first_block_raises(self):
+    # Enough valid rows that the bad byte is only decoded while iterating.
+    contents = b'id,title\n' + b'sku,Shoe\n' * 2000 + b'sku-x,Caf\xe9\n'
+    feed = io.TextIOWrapper(io.BytesIO(contents), encoding='utf-8', newline='')
+    reader = highlight_gen.FeedReader(feed, 'feed.csv')
+
+    with self.assertRaisesRegex(ValueError, 'not valid UTF-8'):
+      list(reader)
+
 
 class TsvWriterTest(absltest.TestCase):
 
