@@ -27,6 +27,7 @@ Example:
 """
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
+import copy
 import csv
 import dataclasses
 import io
@@ -85,6 +86,11 @@ IMAGE_REQUEST_TIMEOUT_S = 10
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 _IMAGE_DOWNLOAD_CHUNK_BYTES = 64 * 1024
 MAX_NEW_TOKENS = 512
+
+# transformers' own defaults for the sampling settings. They have no effect
+# under greedy decoding. Unlike None, which generate() replaces with the
+# model's defaults, they don't trigger warnings about unused settings.
+_NEUTRAL_SAMPLING_SETTINGS = {'temperature': 1.0, 'top_p': 1.0, 'top_k': 50}
 
 # Stop the run when the model fails on this many products in a row, since the
 # cause (e.g. GPU out of memory) is then almost certainly systemic.
@@ -618,6 +624,37 @@ def _generate_highlights_isolated(
     )
 
 
+def _generate_highlights_isolated(
+    product: Mapping[str, str],
+    generator: TextGenerator,
+    http_get: HttpGet,
+) -> HighlightResult:
+  """Calls `generate_highlights`, turning unexpected errors into a result.
+
+  This is the isolation point that stops one bad product from ending a run
+  that may last days. Unexpected errors are logged with their traceback and
+  counted as model failures, so a bug that affects every product still stops
+  the run (see `MAX_CONSECUTIVE_MODEL_FAILURES`).
+
+  Args:
+    product: One feed row.
+    generator: Sends chat messages to the model.
+    http_get: Function used to download the product image.
+
+  Returns:
+    The result of `generate_highlights`, or a failed result.
+  """
+  try:
+    return generate_highlights(product, generator, http_get)
+  except Exception as e:
+    logging.exception(
+        'Unexpected error for product %s', product.get('id') or '(no id)'
+    )
+    return HighlightResult(
+        highlights=(), error=f'Unexpected error: {e!r}', model_failed=True
+    )
+
+
 def validate_paths(input_path: str, output_path: str) -> None:
   """Checks the feed paths before any work starts.
 
@@ -756,6 +793,33 @@ def resolve_model_path(
   return model_path
 
 
+def build_generation_config(
+    base: transformers.GenerationConfig,
+) -> transformers.GenerationConfig:
+  """Returns the generation settings for highlights, based on the model's own.
+
+  All settings are kept in one config object, rather than partly passed as
+  separate arguments. Passing both made transformers log a warning on every
+  product, which would flood the log on large feeds.
+
+  Args:
+    base: The model's default generation config. It is not modified.
+
+  Returns:
+    A copy of `base` set up for greedy decoding of up to `MAX_NEW_TOKENS`.
+  """
+  config = copy.deepcopy(base)
+  config.max_new_tokens = MAX_NEW_TOKENS
+  # Unset the library default (20 tokens), so that only max_new_tokens limits
+  # the output length.
+  config.max_length = None
+  # Greedy decoding: the same feed always produces the same highlights, which
+  # makes runs reproducible and resumed runs consistent.
+  config.do_sample = False
+  config.update(**_NEUTRAL_SAMPLING_SETTINGS)
+  return config
+
+
 def load_generator(model_path: str) -> TextGenerator:
   """Loads the Gemma model as a text generator.
 
@@ -771,12 +835,13 @@ def load_generator(model_path: str) -> TextGenerator:
       device_map='auto',
       dtype='auto',
   )
+  generation_config = build_generation_config(pipe.generation_config)
 
   def _generate(messages: list[dict[str, Any]]) -> Any:
     return pipe(
         messages,
         return_full_text=False,
-        generate_kwargs={'max_new_tokens': MAX_NEW_TOKENS},
+        generate_kwargs={'generation_config': generation_config},
     )
 
   return _generate

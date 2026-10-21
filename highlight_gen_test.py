@@ -23,6 +23,7 @@ from absl.testing import flagsaver
 from absl.testing import parameterized
 from PIL import Image
 import requests
+import transformers
 
 import highlight_gen
 
@@ -798,6 +799,45 @@ class ProcessFeedTest(absltest.TestCase):
 
     self.assertEqual(summary.processed_count, 11)
     self.assertEqual(summary.failed_count, 11)
+
+
+class BuildGenerationConfigTest(absltest.TestCase):
+
+  def _model_defaults(self) -> transformers.GenerationConfig:
+    # Mirrors the relevant parts of Gemma's generation_config.json plus the
+    # library default max_length.
+    return transformers.GenerationConfig(
+        max_length=20, do_sample=True, temperature=1.0, top_p=0.95, top_k=64
+    )
+
+  def test_sets_greedy_decoding_with_neutral_sampling_settings(self):
+    config = highlight_gen.build_generation_config(self._model_defaults())
+
+    self.assertEqual(config.max_new_tokens, 512)
+    self.assertIsNone(config.max_length)
+    self.assertFalse(config.do_sample)
+    self.assertEqual(config.temperature, 1.0)
+    self.assertEqual(config.top_p, 1.0)
+    self.assertEqual(config.top_k, 50)
+
+  def test_does_not_modify_the_model_defaults(self):
+    defaults = self._model_defaults()
+
+    highlight_gen.build_generation_config(defaults)
+
+    self.assertEqual(defaults.max_length, 20)
+    self.assertTrue(defaults.do_sample)
+    self.assertEqual(defaults.top_k, 64)
+
+  def test_stays_valid_after_model_defaults_are_filled_in(self):
+    defaults = self._model_defaults()
+    config = highlight_gen.build_generation_config(defaults)
+    # generate() fills any unset (None) values from the model's defaults.
+    config.update(**defaults.to_dict(), defaults_only=True)
+
+    # Raises if any setting would be ignored, e.g. top_k under greedy
+    # decoding, which is what makes transformers log a warning.
+    config.validate(strict=True)
 
 
 class ResolveModelPathTest(absltest.TestCase):
