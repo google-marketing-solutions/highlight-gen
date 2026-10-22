@@ -624,37 +624,6 @@ def _generate_highlights_isolated(
     )
 
 
-def _generate_highlights_isolated(
-    product: Mapping[str, str],
-    generator: TextGenerator,
-    http_get: HttpGet,
-) -> HighlightResult:
-  """Calls `generate_highlights`, turning unexpected errors into a result.
-
-  This is the isolation point that stops one bad product from ending a run
-  that may last days. Unexpected errors are logged with their traceback and
-  counted as model failures, so a bug that affects every product still stops
-  the run (see `MAX_CONSECUTIVE_MODEL_FAILURES`).
-
-  Args:
-    product: One feed row.
-    generator: Sends chat messages to the model.
-    http_get: Function used to download the product image.
-
-  Returns:
-    The result of `generate_highlights`, or a failed result.
-  """
-  try:
-    return generate_highlights(product, generator, http_get)
-  except Exception as e:
-    logging.exception(
-        'Unexpected error for product %s', product.get('id') or '(no id)'
-    )
-    return HighlightResult(
-        highlights=(), error=f'Unexpected error: {e!r}', model_failed=True
-    )
-
-
 def validate_paths(input_path: str, output_path: str) -> None:
   """Checks the feed paths before any work starts.
 
