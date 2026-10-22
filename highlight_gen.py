@@ -647,6 +647,30 @@ def validate_paths(input_path: str, output_path: str) -> None:
     )
 
 
+def _claim_product_id(product: Mapping[str, str], seen_ids: set[str]) -> str:
+  """Records a product's id as seen, or says why the product must be skipped.
+
+  Merchant Center needs an `id` to match each row to a product, and a feed
+  with the same id twice is ambiguous, so only the first row with each id is
+  processed.
+
+  Args:
+    product: One feed row.
+    seen_ids: Ids of the products already processed in this run. The product's
+      id is added if it is valid.
+
+  Returns:
+    Why the product must be skipped, or an empty string if it can be processed.
+  """
+  product_id = product.get('id', '').strip()
+  if not product_id:
+    return 'Missing id'
+  if product_id in seen_ids:
+    return 'Duplicate id; only the first row with this id is used'
+  seen_ids.add(product_id)
+  return ''
+
+
 def process_feed(
     input_path: str,
     output_path: str,
@@ -659,11 +683,13 @@ def process_feed(
   Only products with valid highlights are written. Products that fail are
   logged and left out of the output, so it never contains empty or error
   values as highlights. An existing `product_highlight` column is overwritten.
+  Products without an `id`, and repeats of an id already seen, are skipped
+  without calling the model.
 
   If the model fails on `MAX_CONSECUTIVE_MODEL_FAILURES` products in a row, the
   run stops, since the cause (e.g. GPU out of memory) is then almost certainly
   systemic. Failures caused by a product's data, such as an unreachable image,
-  do not count towards this limit and reset it.
+  do not count towards this limit and reset it. Skipped ids leave it unchanged.
 
   Args:
     input_path: Path to the input feed (CSV or TSV).
@@ -686,6 +712,7 @@ def process_feed(
   processed_count = 0
   failed_count = 0
   consecutive_model_failures = 0
+  seen_ids = set()
   # `utf-8-sig` drops the byte-order mark that spreadsheet exports often add.
   with (
       open(input_path, encoding='utf-8-sig', newline='') as input_file,
@@ -702,7 +729,11 @@ def process_feed(
     for product in tqdm.tqdm(
         products, total=num_rows or None, desc='Generating highlights'
     ):
-      result = _generate_highlights_isolated(product, generator, http_get)
+      id_error = _claim_product_id(product, seen_ids)
+      if id_error:
+        result = HighlightResult(highlights=(), error=id_error)
+      else:
+        result = _generate_highlights_isolated(product, generator, http_get)
       processed_count += 1
       if not result.error:
         consecutive_model_failures = 0
@@ -716,6 +747,10 @@ def process_feed(
           product.get('id') or '(no id)',
           result.error,
       )
+      if id_error:
+        # The model was not called, so this says nothing about whether it
+        # works: the count of consecutive model failures is left unchanged.
+        continue
       if not result.model_failed:
         consecutive_model_failures = 0
         continue

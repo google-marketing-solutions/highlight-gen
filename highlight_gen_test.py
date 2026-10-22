@@ -617,7 +617,7 @@ class TsvWriterTest(absltest.TestCase):
     self.assertEqual(output.getvalue().splitlines()[1], 'sku-1\t')
 
 
-class ProcessFeedTest(absltest.TestCase):
+class ProcessFeedTest(parameterized.TestCase):
 
   def _run(
       self,
@@ -799,6 +799,67 @@ class ProcessFeedTest(absltest.TestCase):
 
     self.assertEqual(summary.processed_count, 11)
     self.assertEqual(summary.failed_count, 11)
+
+  def test_product_without_id_is_left_out_without_calling_the_model(self):
+    feed = (
+        'id,image_link\n'
+        ',https://cdn.example.com/a.jpg\n'
+        'b,https://cdn.example.com/b.jpg\n'
+    )
+    generator = _FakeGenerator('Breathable mesh, Grippy sole')
+
+    summary, lines = self._run(feed, generator)
+
+    self.assertEqual(
+        lines[1:],
+        ['b\thttps://cdn.example.com/b.jpg\tBreathable mesh,Grippy sole'],
+    )
+    self.assertLen(generator.calls, 1)
+    self.assertEqual(summary.failed_count, 1)
+
+  def test_duplicate_id_keeps_only_the_first_row(self):
+    feed = (
+        'id,image_link\n'
+        'a,https://cdn.example.com/a.jpg\n'
+        'a,https://cdn.example.com/other.jpg\n'
+    )
+    generator = _FakeGenerator('Breathable mesh, Grippy sole')
+
+    summary, lines = self._run(feed, generator)
+
+    self.assertEqual(
+        lines[1:],
+        ['a\thttps://cdn.example.com/a.jpg\tBreathable mesh,Grippy sole'],
+    )
+    self.assertLen(generator.calls, 1)
+    self.assertEqual(summary.failed_count, 1)
+
+  @parameterized.named_parameters(
+      ('missing_id', ',https://cdn.example.com/no_id.jpg\n'),
+      ('duplicate_id', 'a,https://cdn.example.com/a_again.jpg\n'),
+  )
+  def test_skipped_ids_leave_the_model_failure_count_unchanged(
+      self, skipped_row
+  ):
+    # Nine model failures, a skipped row, then one more model failure. The run
+    # stops on the tenth model call only if the skipped row neither resets nor
+    # adds to the count of consecutive model failures.
+    feed = (
+        _feed_with_images(*'abcdefghi')
+        + skipped_row
+        + 'j,https://cdn.example.com/j.jpg\n'
+    )
+    input_path = self.create_tempfile(content=feed).full_path
+    output_path = os.path.join(self.create_tempdir().full_path, 'out.tsv')
+    generator = _FakeGenerator(error=RuntimeError('CUDA error'))
+
+    with self.assertRaises(highlight_gen.TooManyModelFailuresError) as raised:
+      highlight_gen.process_feed(
+          input_path, output_path, generator, 0, _image_get()
+      )
+
+    self.assertIn('10 products in a row', str(raised.exception))
+    self.assertLen(generator.calls, 10)
 
 
 class BuildGenerationConfigTest(absltest.TestCase):
