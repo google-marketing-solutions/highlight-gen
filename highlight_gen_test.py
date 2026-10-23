@@ -1079,7 +1079,165 @@ class ResolveModelPathTest(absltest.TestCase):
     self.assertEmpty(downloader.handles)
 
 
+class ResumeTest(absltest.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    self._output_path = os.path.join(self.create_tempdir().full_path, 'out.tsv')
+
+  def _process(
+      self, feed: str, generator: _FakeGenerator, **kwargs
+  ) -> highlight_gen.FeedSummary:
+    input_path = self.create_tempfile(content=feed).full_path
+    return highlight_gen.process_feed(
+        input_path,
+        self._output_path,
+        generator,
+        http_get=_image_get(),
+        **kwargs,
+    )
+
+  def test_continues_an_interrupted_run(self):
+    feed = _feed_with_images('a', 'b', 'c')
+    with self.assertRaises(_RunStoppedError):
+      self._process(feed, _FailOnCallGenerator('Breathable mesh, Light', 2))
+    generator = _FakeGenerator('Breathable mesh, Light')
+
+    summary = self._process(feed, generator, resume=True)
+
+    self.assertEqual(
+        _read_lines(self._output_path),
+        [
+            'id\timage_link\tproduct_highlight',
+            'a\thttps://cdn.example.com/a.jpg\tBreathable mesh,Light',
+            'b\thttps://cdn.example.com/b.jpg\tBreathable mesh,Light',
+            'c\thttps://cdn.example.com/c.jpg\tBreathable mesh,Light',
+        ],
+    )
+    self.assertLen(generator.calls, 2)
+    self.assertEqual(summary.resumed_count, 1)
+
+  def test_retries_products_that_failed_before(self):
+    feed = _feed_with_images('a', 'b')
+    self._process(
+        feed, _SequenceGenerator([RuntimeError('CUDA error'), 'Grippy, Light'])
+    )
+    generator = _FakeGenerator('Breathable mesh, Light')
+
+    self._process(feed, generator, resume=True)
+
+    self.assertEqual(
+        _read_lines(self._output_path)[1:],
+        [
+            'b\thttps://cdn.example.com/b.jpg\tGrippy,Light',
+            'a\thttps://cdn.example.com/a.jpg\tBreathable mesh,Light',
+        ],
+    )
+    self.assertLen(generator.calls, 1)
+
+  def test_removes_an_incomplete_last_line(self):
+    self.create_tempfile(
+        self._output_path,
+        content=(
+            'id\timage_link\tproduct_highlight\n'
+            'a\thttps://cdn.example.com/a.jpg\tGrippy,Light\n'
+            'b\thttps://cdn.exa'
+        ),
+    )
+    generator = _FakeGenerator('Breathable mesh, Light')
+
+    self._process(_feed_with_images('a', 'b'), generator, resume=True)
+
+    self.assertEqual(
+        _read_lines(self._output_path)[1:],
+        [
+            'a\thttps://cdn.example.com/a.jpg\tGrippy,Light',
+            'b\thttps://cdn.example.com/b.jpg\tBreathable mesh,Light',
+        ],
+    )
+    self.assertLen(generator.calls, 1)
+
+  def test_output_with_different_columns_raises_and_is_kept(self):
+    contents = 'id\ttitle\tproduct_highlight\na\tShoe\tGrippy,Light\n'
+    self.create_tempfile(self._output_path, content=contents)
+
+    with self.assertRaisesRegex(ValueError, 'do not match'):
+      self._process(
+          _feed_with_images('a'), _FakeGenerator('unused'), resume=True
+      )
+
+    self.assertEqual(_read_lines(self._output_path), contents.splitlines())
+
+  def test_output_without_id_column_raises_and_is_kept(self):
+    contents = 'sku\timage_link\tproduct_highlight\nx\thttps://x.jpg\tGrippy\n'
+    self.create_tempfile(self._output_path, content=contents)
+    feed = 'sku,image_link\nx,https://cdn.example.com/x.jpg\n'
+
+    with self.assertRaisesRegex(ValueError, 'no id column'):
+      self._process(feed, _FakeGenerator('unused'), resume=True)
+
+    self.assertEqual(_read_lines(self._output_path), contents.splitlines())
+
+  def test_blank_id_in_output_does_not_mark_products_as_written(self):
+    self.create_tempfile(
+        self._output_path,
+        content=(
+            'id\timage_link\tproduct_highlight\n'
+            '\thttps://cdn.example.com/x.jpg\tGrippy,Light\n'
+        ),
+    )
+    feed = 'id,image_link\n,https://cdn.example.com/b.jpg\n'
+
+    summary = self._process(feed, _FakeGenerator('unused'), resume=True)
+
+    self.assertEqual(summary.resumed_count, 0)
+    self.assertEqual(summary.failed_count, 1)
+
+  def test_overwrite_and_resume_together_raise(self):
+    with self.assertRaisesRegex(ValueError, 'cannot be used together'):
+      self._process(
+          _feed_with_images('a'),
+          _FakeGenerator('unused'),
+          overwrite=True,
+          resume=True,
+      )
+
+  def test_missing_output_starts_a_new_run(self):
+    summary = self._process(
+        _feed_with_images('a'), _FakeGenerator('Grippy, Light'), resume=True
+    )
+
+    self.assertEqual(
+        _read_lines(self._output_path),
+        [
+            'id\timage_link\tproduct_highlight',
+            'a\thttps://cdn.example.com/a.jpg\tGrippy,Light',
+        ],
+    )
+    self.assertEqual(summary.resumed_count, 0)
+
+  def test_num_rows_is_the_total_for_the_whole_job(self):
+    feed = _feed_with_images('a', 'b', 'c', 'd')
+    self._process(feed, _FakeGenerator('Grippy, Light'), num_rows=2)
+    generator = _FakeGenerator('Grippy, Light')
+
+    self._process(feed, generator, num_rows=3, resume=True)
+
+    self.assertEqual(
+        [line.split('\t')[0] for line in _read_lines(self._output_path)[1:]],
+        ['a', 'b', 'c'],
+    )
+    self.assertLen(generator.calls, 1)
+
+
 class MainTest(parameterized.TestCase):
+
+  def test_overwrite_and_resume_together_raise_usage_error(self):
+    with flagsaver.flagsaver(
+        input_file='feed.csv', overwrite=True, resume=True
+    ):
+      with self.assertRaisesRegex(app.UsageError, 'cannot be used together'):
+        highlight_gen.main(['highlight_gen'])
 
   def test_missing_input_file_raises_usage_error(self):
     with flagsaver.flagsaver(input_file='', output_file='out.tsv'):

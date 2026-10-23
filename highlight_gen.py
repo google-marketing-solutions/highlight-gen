@@ -64,6 +64,12 @@ _OVERWRITE = flags.DEFINE_bool(
     'Replace the output file if it already exists and is not empty. Without'
     ' this flag, HighlightGen stops rather than overwrite it.',
 )
+_RESUME = flags.DEFINE_bool(
+    'resume',
+    False,
+    'Continue an interrupted run: keep the products already in the output file'
+    ' and process only the rest. Products that failed before are retried.',
+)
 _NUM_ROWS = flags.DEFINE_integer(
     'num_rows',
     0,
@@ -106,6 +112,8 @@ MAX_CONSECUTIVE_MODEL_FAILURES = 10
 # The csv module's default field size limit (128 KiB) is too small for some
 # feeds, e.g. descriptions containing HTML.
 _MAX_FEED_FIELD_BYTES = 10 * 1024 * 1024
+# Block size for finding the last line break of an output file when resuming.
+_BACKWARD_SCAN_BLOCK_BYTES = 64 * 1024
 
 # Merchant Center limits, see
 # https://support.google.com/merchants/answer/9216100.
@@ -192,12 +200,15 @@ class FeedSummary:
     failed_count: Number of processed products left out of the output because no
       valid highlights could be generated.
     skipped_line_count: Number of malformed input lines that were skipped.
+    resumed_count: Number of products kept from an earlier run's output, which
+      were not processed again.
   """
 
   processed_count: int
   written_count: int
   failed_count: int
   skipped_line_count: int
+  resumed_count: int
 
 
 def _detect_delimiter(header_line: str, source_name: str) -> str:
@@ -341,12 +352,19 @@ class TsvWriter:
   break the file structure.
   """
 
-  def __init__(self, output_file: TextIO, columns: Sequence[str]):
+  def __init__(
+      self,
+      output_file: TextIO,
+      columns: Sequence[str],
+      write_header: bool = True,
+  ):
     """Initializes the writer and writes the header row.
 
     Args:
       output_file: The open output file.
       columns: Column names, in output order.
+      write_header: Whether to write the header row. False when appending to a
+        file that already has one.
     """
     self._output_file = output_file
     self._columns = columns
@@ -358,7 +376,8 @@ class TsvWriter:
         escapechar=None,
         lineterminator='\n',
     )
-    self._write_fields(columns)
+    if write_header:
+      self._write_fields(columns)
 
   def write_row(self, row: Mapping[str, str]) -> None:
     """Writes one product, using empty values for any missing columns."""
@@ -660,7 +679,10 @@ def failures_path(output_path: str) -> str:
 
 
 def validate_paths(
-    input_path: str, output_path: str, overwrite: bool = False
+    input_path: str,
+    output_path: str,
+    overwrite: bool = False,
+    resume: bool = False,
 ) -> None:
   """Checks the feed paths before any work starts.
 
@@ -668,15 +690,22 @@ def validate_paths(
     input_path: Path to the input feed.
     output_path: Path the output feed will be written to.
     overwrite: Whether an existing, non-empty output may be replaced.
+    resume: Whether an existing output will be continued.
 
   Raises:
     FileNotFoundError: If the input feed does not exist.
-    FileExistsError: If the output already exists, is not empty and
-      `overwrite` is False. A finished run can take days, so it is never
-      replaced by accident.
-    ValueError: If the output path, or the failures file derived from it, is
-      the input feed, which would be erased before it is read.
+    FileExistsError: If the output already exists, is not empty and neither
+      `overwrite` nor `resume` is set. A finished run can take days, so it is
+      never replaced by accident.
+    ValueError: If both `overwrite` and `resume` are set, or the output path,
+      or the failures file derived from it, is the input feed, which would be
+      erased before it is read.
   """
+  if overwrite and resume:
+    raise ValueError(
+        'overwrite and resume cannot be used together: one replaces the'
+        ' existing output and the other continues it.'
+    )
   if not os.path.isfile(input_path):
     raise FileNotFoundError(
         f'Input feed {input_path!r} does not exist or is not a regular file.'
@@ -695,14 +724,94 @@ def validate_paths(
         ' erased before it is read.'
     )
   if (
-      not overwrite
+      not (overwrite or resume)
       and os.path.isfile(output_path)
       and os.path.getsize(output_path) > 0
   ):
     raise FileExistsError(
         f'Output file {output_path!r} already exists and is not empty. Pass'
-        ' --overwrite to replace it, or choose a different --output_file.'
+        ' --resume to continue it, --overwrite to replace it, or choose a'
+        ' different --output_file.'
     )
+
+
+def _remove_partial_last_line(path: str) -> None:
+  """Cuts a file back to its last line break.
+
+  A run that is killed while writing can leave an incomplete last row, which
+  would otherwise be kept as a corrupt product.
+
+  Args:
+    path: The file to check.
+  """
+  with open(path, 'rb+') as f:
+    end = f.seek(0, os.SEEK_END)
+    position = end
+    # Scan backwards in blocks, so huge files are not read into memory.
+    while position > 0:
+      block_start = max(0, position - _BACKWARD_SCAN_BLOCK_BYTES)
+      f.seek(block_start)
+      block = f.read(position - block_start)
+      line_break = block.rfind(b'\n')
+      if line_break != -1:
+        keep = block_start + line_break + 1
+        break
+      position = block_start
+    else:
+      keep = 0
+    if keep < end:
+      f.truncate(keep)
+      logging.warning(
+          'Removed an incomplete last line from %s, left by an interrupted'
+          ' run.',
+          path,
+      )
+
+
+def read_written_ids(output_path: str, columns: Sequence[str]) -> set[str]:
+  """Returns the ids of products already in an output, to resume a run.
+
+  An incomplete last line, left by a run that was killed while writing, is
+  removed from the file first.
+
+  Args:
+    output_path: Path of the output written by the earlier run.
+    columns: The columns the output is expected to have, in order.
+
+  Returns:
+    The non-empty ids already written. Empty if there is nothing to resume, in
+    which case the output should be written from the start.
+
+  Raises:
+    ValueError: If the output's header does not match `columns`, e.g. because
+      it was written for a different input feed, or has no `id` column to
+      tell which products were already written.
+  """
+  if not os.path.isfile(output_path):
+    logging.info('Nothing to resume: %s does not exist yet.', output_path)
+    return set()
+  _remove_partial_last_line(output_path)
+  with open(output_path, encoding='utf-8', newline='') as output_file:
+    rows = csv.reader(output_file, delimiter='\t', quoting=csv.QUOTE_NONE)
+    header = next(rows, None)
+    if header is None:
+      logging.info('Nothing to resume: %s is empty.', output_path)
+      return set()
+    if header != list(columns):
+      raise ValueError(
+          f'Cannot resume {output_path!r}: its columns {header} do not match'
+          f' the columns expected for this input feed, {list(columns)}. Check'
+          ' that --input_file is the feed the output was written from.'
+      )
+    if 'id' not in header:
+      raise ValueError(
+          f'Cannot resume {output_path!r}: it has no id column, which is'
+          ' needed to tell which products were already written.'
+      )
+    id_index = header.index('id')
+    ids = (row[id_index].strip() for row in rows if len(row) > id_index)
+    # A blank id cannot identify a product, so it never marks one as written.
+    return {product_id for product_id in ids if product_id}
 
 
 def _claim_product_id(product: Mapping[str, str], seen_ids: set[str]) -> str:
@@ -736,6 +845,7 @@ def process_feed(
     num_rows: int = 0,
     http_get: HttpGet = requests.get,
     overwrite: bool = False,
+    resume: bool = False,
 ) -> FeedSummary:
   """Streams a feed through the model, writing each product as it finishes.
 
@@ -751,6 +861,10 @@ def process_feed(
   systemic. Failures caused by a product's data, such as an unreachable image,
   do not count towards this limit and reset it. Skipped ids leave it unchanged.
 
+  With `resume`, products already in the output are kept and not processed
+  again, and new products are appended. Products that failed in the earlier
+  run are not in the output, so they are retried.
+
   Args:
     input_path: Path to the input feed (CSV or TSV).
     output_path: Path to write the enriched TSV feed to.
@@ -758,83 +872,100 @@ def process_feed(
     num_rows: Number of products to process. 0 processes all products.
     http_get: Function used to download product images.
     overwrite: Whether an existing, non-empty output may be replaced.
+    resume: Whether to continue an existing output instead of replacing it.
 
   Returns:
-    Counts of processed, written, failed and skipped products.
+    Counts of processed, written, failed, skipped and resumed products.
 
   Raises:
     FileNotFoundError: If the input feed does not exist.
-    FileExistsError: If the output already exists, is not empty and
-      `overwrite` is False.
-    ValueError: If the paths are invalid, or the feed is malformed in a way
-      that cannot be skipped safely.
+    FileExistsError: If the output already exists, is not empty and neither
+      `overwrite` nor `resume` is set.
+    ValueError: If the paths are invalid, the feed is malformed in a way that
+      cannot be skipped safely, or the output to resume has different columns.
     TooManyModelFailuresError: If the model fails on too many products in a
       row.
   """
-  validate_paths(input_path, output_path, overwrite)
+  validate_paths(input_path, output_path, overwrite, resume)
   processed_count = 0
   failed_count = 0
+  resumed_count = 0
   consecutive_model_failures = 0
   seen_ids = set()
   # `utf-8-sig` drops the byte-order mark that spreadsheet exports often add.
-  with (
-      open(input_path, encoding='utf-8-sig', newline='') as input_file,
-      open(output_path, 'w', encoding='utf-8', newline='') as output_file,
-      open(
-          failures_path(output_path), 'w', encoding='utf-8', newline=''
-      ) as failures_file,
-  ):
+  with open(input_path, encoding='utf-8-sig', newline='') as input_file:
     reader = FeedReader(input_file, input_path)
     columns = list(reader.columns)
     if HIGHLIGHT_COLUMN not in columns:
       columns.append(HIGHLIGHT_COLUMN)
-    writer = TsvWriter(output_file, columns)
-    failures_writer = TsvWriter(failures_file, ['id', 'reason'])
-    # Limiting the rows up front, rather than breaking out of the loop,
-    # lets the progress bar count the last product too.
-    products = itertools.islice(reader, num_rows) if num_rows else reader
-    for product in tqdm.tqdm(
-        products, total=num_rows or None, desc='Generating highlights'
+    written_ids = read_written_ids(output_path, columns) if resume else set()
+    with (
+        open(
+            output_path,
+            'a' if written_ids else 'w',
+            encoding='utf-8',
+            newline='',
+        ) as output_file,
+        open(
+            failures_path(output_path), 'w', encoding='utf-8', newline=''
+        ) as failures_file,
     ):
-      id_error = _claim_product_id(product, seen_ids)
-      if id_error:
-        result = HighlightResult(highlights=(), error=id_error)
-      else:
-        result = _generate_highlights_isolated(product, generator, http_get)
-      processed_count += 1
-      if not result.error:
-        consecutive_model_failures = 0
-        writer.write_row(
-            {**product, HIGHLIGHT_COLUMN: format_highlights(result.highlights)}
+      writer = TsvWriter(output_file, columns, write_header=not written_ids)
+      failures_writer = TsvWriter(failures_file, ['id', 'reason'])
+      # Limiting the rows up front, rather than breaking out of the loop,
+      # lets the progress bar count the last product too. When resuming,
+      # this keeps --num_rows the total for the whole job.
+      products = itertools.islice(reader, num_rows) if num_rows else reader
+      for product in tqdm.tqdm(
+          products, total=num_rows or None, desc='Generating highlights'
+      ):
+        product_id = product.get('id', '').strip()
+        if product_id in written_ids and product_id not in seen_ids:
+          seen_ids.add(product_id)
+          resumed_count += 1
+          continue
+        id_error = _claim_product_id(product, seen_ids)
+        if id_error:
+          result = HighlightResult(highlights=(), error=id_error)
+        else:
+          result = _generate_highlights_isolated(product, generator, http_get)
+        processed_count += 1
+        if not result.error:
+          consecutive_model_failures = 0
+          writer.write_row({
+              **product,
+              HIGHLIGHT_COLUMN: format_highlights(result.highlights),
+          })
+          continue
+        failed_count += 1
+        logging.warning(
+            'No highlights for product %s: %s',
+            product.get('id') or '(no id)',
+            result.error,
         )
-        continue
-      failed_count += 1
-      logging.warning(
-          'No highlights for product %s: %s',
-          product.get('id') or '(no id)',
-          result.error,
-      )
-      failures_writer.write_row(
-          {'id': product.get('id', ''), 'reason': result.error}
-      )
-      if id_error:
-        # The model was not called, so this says nothing about whether it
-        # works: the count of consecutive model failures is left unchanged.
-        continue
-      if not result.model_failed:
-        consecutive_model_failures = 0
-        continue
-      consecutive_model_failures += 1
-      if consecutive_model_failures >= MAX_CONSECUTIVE_MODEL_FAILURES:
-        raise TooManyModelFailuresError(
-            f'The model failed on {consecutive_model_failures} products in a'
-            f' row; last error: {result.error}. Fix the cause and re-run.'
+        failures_writer.write_row(
+            {'id': product.get('id', ''), 'reason': result.error}
         )
+        if id_error:
+          # The model was not called, so this says nothing about whether it
+          # works: the count of consecutive model failures is left unchanged.
+          continue
+        if not result.model_failed:
+          consecutive_model_failures = 0
+          continue
+        consecutive_model_failures += 1
+        if consecutive_model_failures >= MAX_CONSECUTIVE_MODEL_FAILURES:
+          raise TooManyModelFailuresError(
+              f'The model failed on {consecutive_model_failures} products in a'
+              f' row; last error: {result.error}. Fix the cause and re-run'
+              ' with --resume.'
+          )
   return FeedSummary(
       processed_count=processed_count,
       written_count=processed_count - failed_count,
       failed_count=failed_count,
       skipped_line_count=reader.skipped_line_count,
+      resumed_count=resumed_count,
   )
 
 
@@ -925,6 +1056,12 @@ def _log_summary(
     summary: FeedSummary, input_path: str, output_path: str
 ) -> None:
   """Logs the outcome of a run, pointing to the files to look at next."""
+  if summary.resumed_count:
+    logging.info(
+        'Kept %d product(s) already in %s from the earlier run.',
+        summary.resumed_count,
+        output_path,
+    )
   logging.info('Wrote %d product(s) to %s.', summary.written_count, output_path)
   if summary.failed_count:
     logging.warning(
@@ -949,12 +1086,14 @@ def main(argv: Sequence[str]) -> None:
   # mandatory for anything that imports this module, such as tests.
   if not _INPUT_FILE.value:
     raise app.UsageError('--input_file is required.')
+  if _OVERWRITE.value and _RESUME.value:
+    raise app.UsageError('--overwrite and --resume cannot be used together.')
   input_path = _INPUT_FILE.value
   output_path = _OUTPUT_FILE.value or default_output_path(input_path)
 
   # Check the paths first, so a typo fails before the model is downloaded or
   # loaded.
-  validate_paths(input_path, output_path, _OVERWRITE.value)
+  validate_paths(input_path, output_path, _OVERWRITE.value, _RESUME.value)
   logging.info('Writing highlights to %s.', output_path)
   generator = load_generator(resolve_model_path(_MODEL_PATH.value))
   summary = process_feed(
@@ -963,6 +1102,7 @@ def main(argv: Sequence[str]) -> None:
       generator,
       _NUM_ROWS.value,
       overwrite=_OVERWRITE.value,
+      resume=_RESUME.value,
   )
   _log_summary(summary, input_path, output_path)
 
