@@ -483,6 +483,11 @@ def _feed_with_images(*product_ids: str) -> str:
   return '\n'.join(['id,image_link', *rows]) + '\n'
 
 
+def _read_lines(path: str) -> list[str]:
+  with open(path, encoding='utf-8') as f:
+    return f.read().splitlines()
+
+
 class _RunStoppedError(KeyboardInterrupt):
   """Simulates a run stopping part-way, e.g. Ctrl+C or a killed job."""
 
@@ -860,6 +865,92 @@ class ProcessFeedTest(parameterized.TestCase):
 
     self.assertIn('10 products in a row', str(raised.exception))
     self.assertLen(generator.calls, 10)
+
+  def test_failures_file_lists_left_out_products_with_reasons(self):
+    feed = (
+        'id,image_link\n'
+        'ok,https://cdn.example.com/a.jpg\n'
+        ',https://cdn.example.com/b.jpg\n'
+        'no_image,\n'
+    )
+    input_path = self.create_tempfile(content=feed).full_path
+    output_path = os.path.join(self.create_tempdir().full_path, 'out.tsv')
+
+    highlight_gen.process_feed(
+        input_path,
+        output_path,
+        _FakeGenerator('Breathable mesh, Grippy sole'),
+        0,
+        _image_get(),
+    )
+
+    self.assertEqual(
+        _read_lines(highlight_gen.failures_path(output_path)),
+        ['id\treason', '\tMissing id', 'no_image\tNo image link provided'],
+    )
+
+  def test_failures_file_is_kept_if_run_stops(self):
+    feed = 'id,image_link\nno_image,\na,https://cdn.example.com/a.jpg\n'
+    input_path = self.create_tempfile(content=feed).full_path
+    output_path = os.path.join(self.create_tempdir().full_path, 'out.tsv')
+    generator = _FailOnCallGenerator('Breathable mesh, Grippy sole', 1)
+
+    with self.assertRaisesRegex(_RunStoppedError, 'Run stopped'):
+      highlight_gen.process_feed(
+          input_path, output_path, generator, 0, _image_get()
+      )
+
+    self.assertEqual(
+        _read_lines(highlight_gen.failures_path(output_path)),
+        ['id\treason', 'no_image\tNo image link provided'],
+    )
+
+  def test_existing_failures_file_is_replaced(self):
+    input_path = self.create_tempfile(content=_feed_with_images('a')).full_path
+    output_path = os.path.join(self.create_tempdir().full_path, 'out.tsv')
+    self.create_tempfile(
+        highlight_gen.failures_path(output_path), content='id\treason\nold\tx\n'
+    )
+
+    highlight_gen.process_feed(
+        input_path,
+        output_path,
+        _FakeGenerator('Breathable mesh, Grippy sole'),
+        0,
+        _image_get(),
+    )
+
+    self.assertEqual(
+        _read_lines(highlight_gen.failures_path(output_path)), ['id\treason']
+    )
+
+  def test_failures_file_that_would_be_the_input_raises_and_keeps_input(self):
+    feed = _feed_with_images('a')
+    feed_dir = self.create_tempdir().full_path
+    input_path = self.create_tempfile(
+        os.path.join(feed_dir, 'feed_failed.tsv'), content=feed
+    ).full_path
+
+    with self.assertRaisesRegex(ValueError, 'failures file'):
+      highlight_gen.process_feed(
+          input_path,
+          os.path.join(feed_dir, 'feed.tsv'),
+          _FakeGenerator('unused'),
+          0,
+          _image_get(),
+      )
+
+    self.assertEqual(_read_lines(input_path), feed.splitlines())
+
+
+class FailuresPathTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      ('replaces_extension', '/data/feed_out.tsv', '/data/feed_out_failed.tsv'),
+      ('no_extension', '/data/feed_out', '/data/feed_out_failed.tsv'),
+  )
+  def test_failures_path(self, output_path, expected):
+    self.assertEqual(highlight_gen.failures_path(output_path), expected)
 
 
 class BuildGenerationConfigTest(absltest.TestCase):

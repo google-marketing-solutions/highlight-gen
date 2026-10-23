@@ -624,6 +624,20 @@ def _generate_highlights_isolated(
     )
 
 
+def failures_path(output_path: str) -> str:
+  """Returns the path of the file that lists failed products for an output.
+
+  Args:
+    output_path: Path of the enriched output feed.
+
+  Returns:
+    The output path with its extension replaced by `_failed.tsv`, e.g.
+    `feed_out_failed.tsv` for `feed_out.tsv`.
+  """
+  stem, _ = os.path.splitext(output_path)
+  return f'{stem}_failed.tsv'
+
+
 def validate_paths(input_path: str, output_path: str) -> None:
   """Checks the feed paths before any work starts.
 
@@ -633,8 +647,8 @@ def validate_paths(input_path: str, output_path: str) -> None:
 
   Raises:
     FileNotFoundError: If the input feed does not exist.
-    ValueError: If the output path is the input feed, which would be erased
-      before it is read.
+    ValueError: If the output path, or the failures file derived from it, is
+      the input feed, which would be erased before it is read.
   """
   if not os.path.isfile(input_path):
     raise FileNotFoundError(
@@ -644,6 +658,14 @@ def validate_paths(input_path: str, output_path: str) -> None:
     raise ValueError(
         f'--output_file {output_path!r} is the input feed. Choose a different'
         ' output path; the input would be erased before it is read.'
+    )
+  if os.path.realpath(input_path) == os.path.realpath(
+      failures_path(output_path)
+  ):
+    raise ValueError(
+        f'The failures file for --output_file {output_path!r} would be the'
+        ' input feed. Choose a different output path; the input would be'
+        ' erased before it is read.'
     )
 
 
@@ -684,7 +706,8 @@ def process_feed(
   logged and left out of the output, so it never contains empty or error
   values as highlights. An existing `product_highlight` column is overwritten.
   Products without an `id`, and repeats of an id already seen, are skipped
-  without calling the model.
+  without calling the model. Every product left out is also listed, with the
+  reason, in the file given by `failures_path`, which is rewritten on each run.
 
   If the model fails on `MAX_CONSECUTIVE_MODEL_FAILURES` products in a row, the
   run stops, since the cause (e.g. GPU out of memory) is then almost certainly
@@ -717,12 +740,16 @@ def process_feed(
   with (
       open(input_path, encoding='utf-8-sig', newline='') as input_file,
       open(output_path, 'w', encoding='utf-8', newline='') as output_file,
+      open(
+          failures_path(output_path), 'w', encoding='utf-8', newline=''
+      ) as failures_file,
   ):
     reader = FeedReader(input_file, input_path)
     columns = list(reader.columns)
     if HIGHLIGHT_COLUMN not in columns:
       columns.append(HIGHLIGHT_COLUMN)
     writer = TsvWriter(output_file, columns)
+    failures_writer = TsvWriter(failures_file, ['id', 'reason'])
     # Limiting the rows up front, rather than breaking out of the loop,
     # lets the progress bar count the last product too.
     products = itertools.islice(reader, num_rows) if num_rows else reader
@@ -746,6 +773,9 @@ def process_feed(
           'No highlights for product %s: %s',
           product.get('id') or '(no id)',
           result.error,
+      )
+      failures_writer.write_row(
+          {'id': product.get('id', ''), 'reason': result.error}
       )
       if id_error:
         # The model was not called, so this says nothing about whether it
@@ -873,8 +903,9 @@ def main(argv: Sequence[str]) -> None:
   if summary.failed_count:
     logging.warning(
         '%d product(s) were left out because no valid highlights could be'
-        ' generated; see warnings above.',
+        ' generated; see %s for the reasons.',
         summary.failed_count,
+        failures_path(_OUTPUT_FILE.value),
     )
   if summary.skipped_line_count:
     logging.warning(
