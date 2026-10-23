@@ -942,6 +942,63 @@ class ProcessFeedTest(parameterized.TestCase):
 
     self.assertEqual(_read_lines(input_path), feed.splitlines())
 
+  def test_existing_output_is_refused_and_kept(self):
+    input_path = self.create_tempfile(content=_feed_with_images('a')).full_path
+    output_path = self.create_tempfile(content='finished run\n').full_path
+
+    with self.assertRaisesRegex(FileExistsError, 'already exists'):
+      highlight_gen.process_feed(
+          input_path, output_path, _FakeGenerator('unused'), 0, _image_get()
+      )
+
+    self.assertEqual(_read_lines(output_path), ['finished run'])
+
+  def test_existing_empty_output_is_replaced(self):
+    input_path = self.create_tempfile(content=_feed_with_images('a')).full_path
+    output_path = self.create_tempfile(content='').full_path
+
+    highlight_gen.process_feed(
+        input_path,
+        output_path,
+        _FakeGenerator('Breathable mesh, Grippy sole'),
+        0,
+        _image_get(),
+    )
+
+    self.assertLen(_read_lines(output_path), 2)
+
+  def test_overwrite_replaces_existing_output(self):
+    input_path = self.create_tempfile(content=_feed_with_images('a')).full_path
+    output_path = self.create_tempfile(content='finished run\n').full_path
+
+    highlight_gen.process_feed(
+        input_path,
+        output_path,
+        _FakeGenerator('Breathable mesh, Grippy sole'),
+        0,
+        _image_get(),
+        overwrite=True,
+    )
+
+    self.assertEqual(
+        _read_lines(output_path),
+        [
+            'id\timage_link\tproduct_highlight',
+            'a\thttps://cdn.example.com/a.jpg\tBreathable mesh,Grippy sole',
+        ],
+    )
+
+
+class DefaultOutputPathTest(parameterized.TestCase):
+
+  @parameterized.named_parameters(
+      ('csv', '/data/feed.csv', '/data/feed_with_highlights.tsv'),
+      ('tsv', '/data/feed.tsv', '/data/feed_with_highlights.tsv'),
+      ('no_extension', '/data/feed', '/data/feed_with_highlights.tsv'),
+  )
+  def test_default_output_path(self, input_path, expected):
+    self.assertEqual(highlight_gen.default_output_path(input_path), expected)
+
 
 class FailuresPathTest(parameterized.TestCase):
 
@@ -1024,15 +1081,25 @@ class ResolveModelPathTest(absltest.TestCase):
 
 class MainTest(parameterized.TestCase):
 
-  @parameterized.named_parameters(
-      ('missing_input', '', 'out.tsv'),
-      ('missing_output', 'feed.csv', ''),
-  )
-  def test_missing_required_flag_raises_usage_error(
-      self, input_file, output_file
-  ):
-    with flagsaver.flagsaver(input_file=input_file, output_file=output_file):
-      with self.assertRaisesRegex(app.UsageError, 'are required'):
+  def test_missing_input_file_raises_usage_error(self):
+    with flagsaver.flagsaver(input_file='', output_file='out.tsv'):
+      with self.assertRaisesRegex(app.UsageError, '--input_file is required'):
+        highlight_gen.main(['highlight_gen'])
+
+  def test_existing_default_output_is_refused_before_loading_model(self):
+    feed_dir = self.create_tempdir().full_path
+    input_path = self.create_tempfile(
+        os.path.join(feed_dir, 'feed.csv'), content=_feed_with_images('a')
+    ).full_path
+    self.create_tempfile(
+        os.path.join(feed_dir, 'feed_with_highlights.tsv'), content='finished'
+    )
+
+    # The model is never loaded: the existing default output is found first.
+    with flagsaver.flagsaver(input_file=input_path, output_file=''):
+      with self.assertRaisesRegex(
+          FileExistsError, 'feed_with_highlights.tsv.*already exists'
+      ):
         highlight_gen.main(['highlight_gen'])
 
   def test_extra_positional_argument_raises_usage_error(self):

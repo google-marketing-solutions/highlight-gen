@@ -55,7 +55,14 @@ _INPUT_FILE = flags.DEFINE_string(
 _OUTPUT_FILE = flags.DEFINE_string(
     'output_file',
     '',
-    'Path to write the enriched feed to (always written as TSV).',
+    'Path to write the enriched feed to (always written as TSV). If empty, it'
+    ' is written next to the input feed as <input name>_with_highlights.tsv.',
+)
+_OVERWRITE = flags.DEFINE_bool(
+    'overwrite',
+    False,
+    'Replace the output file if it already exists and is not empty. Without'
+    ' this flag, HighlightGen stops rather than overwrite it.',
 )
 _NUM_ROWS = flags.DEFINE_integer(
     'num_rows',
@@ -624,6 +631,20 @@ def _generate_highlights_isolated(
     )
 
 
+def default_output_path(input_path: str) -> str:
+  """Returns where to write the output when no output path is given.
+
+  Args:
+    input_path: Path to the input feed.
+
+  Returns:
+    The input path with its extension replaced by `_with_highlights.tsv`, e.g.
+    `feed_with_highlights.tsv` for `feed.csv`.
+  """
+  stem, _ = os.path.splitext(input_path)
+  return f'{stem}_with_highlights.tsv'
+
+
 def failures_path(output_path: str) -> str:
   """Returns the path of the file that lists failed products for an output.
 
@@ -638,15 +659,21 @@ def failures_path(output_path: str) -> str:
   return f'{stem}_failed.tsv'
 
 
-def validate_paths(input_path: str, output_path: str) -> None:
+def validate_paths(
+    input_path: str, output_path: str, overwrite: bool = False
+) -> None:
   """Checks the feed paths before any work starts.
 
   Args:
     input_path: Path to the input feed.
     output_path: Path the output feed will be written to.
+    overwrite: Whether an existing, non-empty output may be replaced.
 
   Raises:
     FileNotFoundError: If the input feed does not exist.
+    FileExistsError: If the output already exists, is not empty and
+      `overwrite` is False. A finished run can take days, so it is never
+      replaced by accident.
     ValueError: If the output path, or the failures file derived from it, is
       the input feed, which would be erased before it is read.
   """
@@ -666,6 +693,15 @@ def validate_paths(input_path: str, output_path: str) -> None:
         f'The failures file for --output_file {output_path!r} would be the'
         ' input feed. Choose a different output path; the input would be'
         ' erased before it is read.'
+    )
+  if (
+      not overwrite
+      and os.path.isfile(output_path)
+      and os.path.getsize(output_path) > 0
+  ):
+    raise FileExistsError(
+        f'Output file {output_path!r} already exists and is not empty. Pass'
+        ' --overwrite to replace it, or choose a different --output_file.'
     )
 
 
@@ -699,6 +735,7 @@ def process_feed(
     generator: TextGenerator,
     num_rows: int = 0,
     http_get: HttpGet = requests.get,
+    overwrite: bool = False,
 ) -> FeedSummary:
   """Streams a feed through the model, writing each product as it finishes.
 
@@ -720,18 +757,21 @@ def process_feed(
     generator: Sends chat messages to the model.
     num_rows: Number of products to process. 0 processes all products.
     http_get: Function used to download product images.
+    overwrite: Whether an existing, non-empty output may be replaced.
 
   Returns:
     Counts of processed, written, failed and skipped products.
 
   Raises:
     FileNotFoundError: If the input feed does not exist.
+    FileExistsError: If the output already exists, is not empty and
+      `overwrite` is False.
     ValueError: If the paths are invalid, or the feed is malformed in a way
       that cannot be skipped safely.
     TooManyModelFailuresError: If the model fails on too many products in a
       row.
   """
-  validate_paths(input_path, output_path)
+  validate_paths(input_path, output_path, overwrite)
   processed_count = 0
   failed_count = 0
   consecutive_model_failures = 0
@@ -881,38 +921,50 @@ def load_generator(model_path: str) -> TextGenerator:
   return _generate
 
 
-def main(argv: Sequence[str]) -> None:
-  if len(argv) > 1:
-    raise app.UsageError('Too many command-line arguments.')
-  # Checked here rather than with `flags.mark_flags_as_required`, which has no
-  # effect on flags with a non-None default, and which would make the flags
-  # mandatory for anything that imports this module, such as tests.
-  if not _INPUT_FILE.value or not _OUTPUT_FILE.value:
-    raise app.UsageError('--input_file and --output_file are required.')
-
-  # Check the paths first, so a typo fails before the model is downloaded or
-  # loaded.
-  validate_paths(_INPUT_FILE.value, _OUTPUT_FILE.value)
-  generator = load_generator(resolve_model_path(_MODEL_PATH.value))
-  summary = process_feed(
-      _INPUT_FILE.value, _OUTPUT_FILE.value, generator, _NUM_ROWS.value
-  )
-  logging.info(
-      'Wrote %d product(s) to %s.', summary.written_count, _OUTPUT_FILE.value
-  )
+def _log_summary(
+    summary: FeedSummary, input_path: str, output_path: str
+) -> None:
+  """Logs the outcome of a run, pointing to the files to look at next."""
+  logging.info('Wrote %d product(s) to %s.', summary.written_count, output_path)
   if summary.failed_count:
     logging.warning(
         '%d product(s) were left out because no valid highlights could be'
         ' generated; see %s for the reasons.',
         summary.failed_count,
-        failures_path(_OUTPUT_FILE.value),
+        failures_path(output_path),
     )
   if summary.skipped_line_count:
     logging.warning(
         'Skipped %d malformed line(s) in %s; see warnings above.',
         summary.skipped_line_count,
-        _INPUT_FILE.value,
+        input_path,
     )
+
+
+def main(argv: Sequence[str]) -> None:
+  if len(argv) > 1:
+    raise app.UsageError('Too many command-line arguments.')
+  # Checked here rather than with `flags.mark_flags_as_required`, which has no
+  # effect on flags with a non-None default, and which would make the flag
+  # mandatory for anything that imports this module, such as tests.
+  if not _INPUT_FILE.value:
+    raise app.UsageError('--input_file is required.')
+  input_path = _INPUT_FILE.value
+  output_path = _OUTPUT_FILE.value or default_output_path(input_path)
+
+  # Check the paths first, so a typo fails before the model is downloaded or
+  # loaded.
+  validate_paths(input_path, output_path, _OVERWRITE.value)
+  logging.info('Writing highlights to %s.', output_path)
+  generator = load_generator(resolve_model_path(_MODEL_PATH.value))
+  summary = process_feed(
+      input_path,
+      output_path,
+      generator,
+      _NUM_ROWS.value,
+      overwrite=_OVERWRITE.value,
+  )
+  _log_summary(summary, input_path, output_path)
 
 
 def run() -> None:
