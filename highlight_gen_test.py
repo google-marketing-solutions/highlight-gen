@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 import io
 import os
 from unittest import mock
@@ -130,7 +130,7 @@ class _SequenceGenerator:
   Each outcome is either the generated text or an exception to raise.
   """
 
-  def __init__(self, outcomes: list[str | Exception]):
+  def __init__(self, outcomes: Sequence[str | Exception]):
     self._outcomes = list(outcomes)
     self.calls = []
 
@@ -1086,7 +1086,7 @@ class ResumeTest(absltest.TestCase):
     self._output_path = os.path.join(self.create_tempdir().full_path, 'out.tsv')
 
   def _process(
-      self, feed: str, generator: _FakeGenerator, **kwargs
+      self, feed: str, generator: highlight_gen.TextGenerator, **kwargs
   ) -> highlight_gen.FeedSummary:
     input_path = self.create_tempfile(content=feed).full_path
     return highlight_gen.process_feed(

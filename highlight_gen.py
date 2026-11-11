@@ -1043,6 +1043,10 @@ def load_generator(model_path: str) -> TextGenerator:
   generation_config = build_generation_config(pipe.generation_config)
 
   def _generate(messages: list[dict[str, Any]]) -> Any:
+    # The pipeline accepts chat messages (a list of dicts) as its first
+    # argument, but its `__call__` overloads only declare image and text inputs,
+    # not the chat format, so the type checker cannot match this call.
+    # pyrefly: ignore[no-matching-overload]
     return pipe(
         messages,
         return_full_text=False,
